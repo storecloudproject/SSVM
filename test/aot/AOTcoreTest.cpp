@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//===-- ssvm/test/core/coreTest.cpp - Wasm test suites --------------------===//
+//===-- ssvm/test/aot/AOTcoreTest.cpp - Wasm test suites ------------------===//
 //
 // Part of the SSVM Project.
 //
@@ -13,8 +13,10 @@
 //===----------------------------------------------------------------------===//
 
 #include "../spec/spectest.h"
+#include "aot/compiler.h"
 #include "support/filesystem.h"
 #include "support/log.h"
+#include "validator/validator.h"
 #include "vm/configure.h"
 #include "vm/vm.h"
 #include "gtest/gtest.h"
@@ -42,18 +44,44 @@ TEST_P(CoreTest, TestSuites) {
   SSVM::VM::VM VM(Conf);
   SSVM::SpecTestModule SpecTestMod;
   VM.registerModule(SpecTestMod);
-  T.onModule = [&VM](const std::string &ModName,
-                     const std::string &Filename) -> Expect<void> {
-    if (!ModName.empty()) {
-      return VM.registerModule(ModName, Filename);
-    } else {
-      return VM.loadWasm(Filename)
-          .and_then([&VM]() { return VM.validate(); })
-          .and_then([&VM]() { return VM.instantiate(); });
+  auto Compile = [&](const std::string &Filename) -> Expect<std::string> {
+    SSVM::Loader::Loader Loader;
+    SSVM::Validator::Validator ValidatorEngine;
+    SSVM::AOT::Compiler Compiler;
+    Compiler.setOptimizationLevel(SSVM::AOT::Compiler::OptimizationLevel::O0);
+    Compiler.setDumpIR(true);
+    auto Path = std::filesystem::u8path(Filename);
+    Path.replace_extension(std::filesystem::u8path(".so"sv));
+    const auto SOPath = Path.u8string();
+    auto Data = *Loader.loadFile(Filename);
+    auto Module = *Loader.parseModule(Data);
+    if (auto Res = ValidatorEngine.validate(*Module); !Res) {
+      return Unexpect(Res);
     }
+    if (auto Res = Compiler.compile(Data, *Module, SOPath); !Res) {
+      return Unexpect(Res);
+    }
+    return SOPath;
   };
-  T.onValidate = [&VM](const std::string &Filename) -> Expect<void> {
-    return VM.loadWasm(Filename).and_then([&VM]() { return VM.validate(); });
+  T.onModule = [&VM, &Compile](const std::string &ModName,
+                               const std::string &Filename) -> Expect<void> {
+    return Compile(Filename).and_then(
+        [&VM, &ModName](const std::string &SOFilename) -> Expect<void> {
+          if (!ModName.empty()) {
+            return VM.registerModule(ModName, SOFilename);
+          } else {
+            return VM.loadWasm(SOFilename)
+                .and_then([&VM]() { return VM.validate(); })
+                .and_then([&VM]() { return VM.instantiate(); });
+          }
+        });
+  };
+  T.onValidate = [&VM, &Compile](const std::string &Filename) -> Expect<void> {
+    return Compile(Filename)
+        .and_then([&](const std::string &SOFilename) -> Expect<void> {
+          return VM.loadWasm(Filename);
+        })
+        .and_then([&VM]() { return VM.validate(); });
   };
   T.onInstantiate = [&VM](const std::string &Filename) -> Expect<void> {
     return VM.loadWasm(Filename)
